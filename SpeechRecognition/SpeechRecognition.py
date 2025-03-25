@@ -1,7 +1,7 @@
 # Python program to translate
 # speech to text and text to speech
 
-
+mode = 0
 import speech_recognition as sr
 import pyttsx3 
 
@@ -42,8 +42,29 @@ while(1):
             MyText = r.recognize_google(audio2)
             MyText = MyText.lower()
 
-
-            print("Did you say " + MyText)
+            if MyText == "stay":
+                if mode == 1:
+                    mode = 0
+                    print("wander mode")
+                else: 
+                    mode = 1
+                    print("Stay mode")
+            elif MyText == "follow":
+                if mode == 2:
+                    mode = 0
+                    print("wander mode")
+                else: 
+                    mode = 2
+                    print("Follow mode")
+            elif MyText == "fetch":
+                if mode == 3:
+                    mode = 0
+                    print("wander mode")
+                else: 
+                    mode = 3
+                    print("Fetch mode")
+            else:
+                print("Did you say " + MyText)
             SpeakText(MyText)
             
     except sr.RequestError as e:
