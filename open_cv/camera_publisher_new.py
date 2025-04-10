@@ -11,7 +11,7 @@ rospy.init_node(publisherNodeName, anonymous=True)
 publisher = rospy.Publisher(topicName, CompressedImage, queue_size=1)
 rate = rospy.Rate(10) # Reduce FPS to 10 for stability
 
-videoCaptureObject = cv2.VideoCapture(1)
+videoCaptureObject = cv2.VideoCapture(0)
 bridgeObject = CvBridge()
 
 while not rospy.is_shutdown():
