@@ -27,15 +27,18 @@ while cam.isOpened():
 
     for object in results:
         boxes = object.boxes
-
+        
         for box in boxes:
-            x1,y1,x2,y2 = box.xyxy[0]
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
+            if (classNames[int(box.cls[0])] == "apple" or classNames[int(box.cls[0])] == "sports ball"):
+                x1,y1,x2,y2 = box.xyxy[0]
+                #cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
+                cv2.circle(frame, (int((x1+x2)/2), int((y1+y2)/2)), int((x2-x1)/2), (255, 0, 255), 3)
 
-            cv2.putText(frame, classNames[int(box.cls[0])], [x1, y1], cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                #cv2.putText(frame, classNames[int(box.cls[0])], (int(x1), int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                #cv2.putText(frame, str(round(box.conf[0].numpy() * 100, 2)) + "%", (int(x2)- 200, int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
         
-    cv2.imshow(frame)
+    cv2.imshow("Yolo", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
