@@ -8,6 +8,12 @@ from cv_bridge import CvBridge
 import numpy as np
 from typing import List, Tuple
 
+print('importing YOLO')
+
+from ultralytics import YOLO
+
+print('done importing YOLO')
+
 class IBVS_Controller():
     '''
     An implementation of an image-based visual servoing controller, as described in https://ieeexplore.ieee.org/document/4015997. Developed by Jay Rana (contact: jay.rana1@gmail.com).
@@ -108,9 +114,14 @@ class IBVS_Controller():
         '''
         Calculate the Moore-Penrose pseudoinverse of the error interaction matrix estimate, `self.L_e_est_pinv`, based on our current control and interaction modes.
         '''
-        assert self.curr_pts is not None, "You must set the current points with set_current_points()."
-        assert self.desired_pts is not None, "You must set the desired points with set_desired_points()."
-
+        if self.interaction_mode == 'curr':
+            assert self.curr_pts is not None, "You must set the current points with set_current_points()."
+        elif self.interaction_mode == 'desired':
+            assert self.desired_pts is not None, "You must set the desired points with set_desired_points()."
+        elif self.interaction_mode == 'mean':
+            assert self.curr_pts is not None, "You must set the current points with set_current_points()."
+            assert self.desired_pts is not None, "You must set the desired points with set_desired_points()."
+            
         # two degrees of freedom: x velocity and z velocity
         if self.control_mode == '2xz':
             # current estimate only
@@ -303,15 +314,67 @@ bridgeObject=CvBridge()
 
 cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
 
-controller = IBVS_Controller(control_mode='2zy', interaction_mode='desired', num_pts=2)
+controller = IBVS_Controller(control_mode='2zy', interaction_mode='mean', num_pts=2)
+controller.set_lambda_matrix(lambdas=[0.5, 1.0])
+controller.set_desired_points(desired_pts=[((205.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.2), ((435.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.2)])
+
+print('importing model')
+model = YOLO("yolo-Weights/yolov8n.pt")
+print('converting model')
+model.to('cuda')
+print('done model')
+
+classNames = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat",
+              "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+              "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+              "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
+              "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+              "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+              "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
+              "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone",
+              "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+              "teddy bear", "hair drier", "toothbrush"
+              ]
 
 curr_frame = None
 def displayCallback(event):
-	rospy.loginfo('displaying frame')
+	#rospy.loginfo('displaying frame')
+	
+	move_cmd = Twist()
+	move_cmd.linear.x = 0.0
+	move_cmd.angular.z = 0.0
+	
 	if curr_frame is not None:
 		converted_frame = bridgeObject.compressed_imgmsg_to_cv2(curr_frame)
-
-		mask = cv2.inRange(converted_frame, (70, 0, 0), (255, 30, 30))
+		
+		results = model(converted_frame, stream=True)
+		
+		for object in results:
+			boxes = object.boxes
+			
+			for box in boxes:
+				if (classNames[int(box.cls[0])] == "apple" or classNames[int(box.cls[0])] == "frisbee" or classNames[int(box.cls[0])] == "mouse" or classNames[int(box.cls[0])] == "sports ball"):
+					x1,y1,x2,y2 = box.xyxy[0]
+					y_center = (float(y1) + float(y2))/2.0
+					#cv2.rectangle(converted_frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
+					cv2.circle(converted_frame, (int((x1+x2)/2), int((y1+y2)/2)), int((x2-x1)/2), (255, 0, 255), 3)
+					
+					focal_length = 960.0
+					curr_depth = (focal_length * 0.065)/(2 * int((x2-x1)/2))
+					#rospy.loginfo(f"curr_depth: {curr_depth}")
+					
+					curr_pts = [((float(x1) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth), ((float(x2) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth)]
+					#rospy.loginfo(f"pts: {curr_pts}")
+					controller.set_current_points(curr_pts=curr_pts)
+					controller.calculate_interaction_matrix()
+					
+					vels = controller.calculate_velocities()
+					#rospy.loginfo(f"vels: {vels}")
+					move_cmd.linear.x = vels[0][0]
+					move_cmd.angular.z = -vels[1][0]
+		
+		'''
+		mask = cv2.inRange(converted_frame, (70, 0, 0), (255, 60, 60))
 		mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 		converted_frame = converted_frame & mask_rgb
 
@@ -319,30 +382,44 @@ def displayCallback(event):
 		gray = cv2.medianBlur(gray, 5)
 		#_, gray = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
 
-		circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, gray.shape[0] / 16, param1=255, param2=10, minRadius=1, maxRadius=200)
+		circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, gray.shape[0], param1=255, param2=10, minRadius=1, maxRadius=200)
 
-		if circles is not None:
+		if circles is not None and len(circles) <= 1:
 			circles = np.uint16(np.around(circles))
 			for i in circles[0, :]:
-				center = (i[0], i[1])
-				cv2.circle(converted_frame, center, 1, (0, 100, 100), 3)
-				radius = i[2]
-				cv2.circle(converted_frame, center, radius, (255, 0, 255), 3)
+				center = (float(i[0]), float(i[1]))
+				#rospy.loginfo(f"center: {center}")
+				cv2.circle(converted_frame, (int(center[0]), int(center[1])), 1, (0, 100, 100), 3)
+				radius = float(i[2])
+				#rospy.loginfo(f"radius: {radius}")
+				cv2.circle(converted_frame, (int(center[0]), int(center[1])), int(radius), (255, 0, 255), 3)
+				
+				#print(f"math: {center[0]} {center[0] - radius} {center[0] - radius - 320.0} {(center[0] - radius - 320.0)/320.0}")
+				
+				focal_length = 960.0
+				curr_depth = (focal_length * 0.065)/(2 * radius)
+				#rospy.loginfo(f"curr_depth: {curr_depth}")
+				
+				curr_pts = [((center[0] - radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth), ((center[0] + radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth)]
+				#rospy.loginfo(f"pts: {curr_pts}")
+				controller.set_current_points(curr_pts=curr_pts)
+				controller.calculate_interaction_matrix()
+				
+				vels = controller.calculate_velocities()
+				#rospy.loginfo(f"vels: {vels}")
+				move_cmd.linear.x = vels[0][0]
+				move_cmd.angular.z = -vels[1][0]
+		'''
 
 		cv2.imshow("camera", converted_frame)
 		cv2.waitKey(1)
-	
-	
-
-	move_cmd = Twist()
-	move_cmd.linear.x = 0.0
-	move_cmd.angular.z = 0.0
+		
 	cmd_vel.publish(move_cmd)
 
 def callbackFunction(message):
 	#bridgeObject = CvBridge()
 
-	rospy.loginfo("received a video message/frame")
+	#rospy.loginfo("received a video message/frame")
 
 	#convertedFrameBackToCV = bridgeObject.imgmsg_to_cv2(message)
 
