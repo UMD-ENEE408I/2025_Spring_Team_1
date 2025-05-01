@@ -4,15 +4,21 @@ import rospy
 from sensor_msgs.msg import CompressedImage
 import cv2 # note this is the correct order, swapped from video.
 from cv_bridge import CvBridge
-
+from ibvs_controller import *
+import time
 import numpy as np
 from typing import List, Tuple
+from geometry_msgs.msg import Twist
 
 print('importing YOLO')
-
 from ultralytics import YOLO
-
 print('done importing YOLO')
+
+subscriberNodeName='camera_sensor_subscriber'
+topicName='video_topic/compressed'
+bridgeObject=CvBridge()
+
+cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
 
 class IBVS_Controller():
     '''
@@ -121,7 +127,7 @@ class IBVS_Controller():
         elif self.interaction_mode == 'mean':
             assert self.curr_pts is not None, "You must set the current points with set_current_points()."
             assert self.desired_pts is not None, "You must set the desired points with set_desired_points()."
-            
+
         # two degrees of freedom: x velocity and z velocity
         if self.control_mode == '2xz':
             # current estimate only
@@ -304,19 +310,9 @@ class IBVS_Controller():
         self.vels = -1.0 * (self.lambda_matrix @ self.L_e_est_pinv @ self.errs)
         return list(self.vels)
 
-
-
-from geometry_msgs.msg import Twist
-
-subscriberNodeName='camera_sensor_subscriber'
-topicName='video_topic/compressed'
-bridgeObject=CvBridge()
-
-cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-
 controller = IBVS_Controller(control_mode='2zy', interaction_mode='mean', num_pts=2)
-controller.set_lambda_matrix(lambdas=[0.5, 1.0])
-controller.set_desired_points(desired_pts=[((205.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.2), ((435.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.2)])
+controller.set_lambda_matrix(lambdas=[0.7, 0.7])
+controller.set_desired_points(desired_pts=[((205.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.24), ((435.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.24)])
 
 print('importing model')
 model = YOLO("yolo-Weights/yolov8n.pt")
@@ -337,6 +333,183 @@ classNames = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "trai
               ]
 
 curr_frame = None
+curr_state = "GO_TO_BALL"
+
+def state_go_to_ball():
+	global curr_state
+
+	move_cmd = Twist()
+	move_cmd.linear.x = 0.0
+	move_cmd.angular.z = 0.0
+	
+	# detect ball and drive to it
+	if curr_frame is not None:
+		converted_frame = bridgeObject.compressed_imgmsg_to_cv2(curr_frame)
+		
+		results = model(converted_frame, stream=True)
+		
+		if len(results) > 0:
+			for object in results:
+				boxes = object.boxes
+				for box in boxes:
+					if (classNames[int(box.cls[0])] == "apple" or classNames[int(box.cls[0])] == "frisbee" or classNames[int(box.cls[0])] == "mouse" or classNames[int(box.cls[0])] == "sports ball"):
+						x1,y1,x2,y2 = box.xyxy[0]
+						y_center = (float(y1) + float(y2))/2.0
+						#cv2.rectangle(converted_frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
+						cv2.circle(converted_frame, (int((x1+x2)/2), int((y1+y2)/2)), int((x2-x1)/2), (255, 0, 255), 3)
+						
+						focal_length = 960.0
+						curr_depth = (focal_length * 0.065)/(2 * int((x2-x1)/2))
+						#rospy.loginfo(f"curr_depth: {curr_depth}")
+						
+						curr_pts = [((float(x1) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth), ((float(x2) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth)]
+						#rospy.loginfo(f"pts: {curr_pts}")
+						controller.set_current_points(curr_pts=curr_pts)
+						controller.calculate_interaction_matrix()
+						
+						vels = controller.calculate_velocities()
+						#rospy.loginfo(f"vels: {vels}")
+						move_cmd.linear.x = vels[0][0]
+						move_cmd.angular.z = -vels[1][0]
+						cmd_vel.publish(move_cmd)
+						
+						err_norm = np.linalg.norm(controller.errs)
+						rospy.loginfo(f"err_norm: {err_norm}")
+						if err_norm < 0.5:
+							curr_state = "REPOSITION"
+		else:
+			curr_state = "LOST_BALL"
+
+def state_lost_ball():
+	global curr_state
+	
+	move_cmd = Twist()
+	move_cmd.linear.x = 0.0
+	move_cmd.angular.z = 0.0
+	
+	# turn to last known position of ball
+	if controller.curr_pts[0][0] < 0:
+		move_cmd.angular.z = -0.3
+	else:
+		move_cmd.angular.z = 0.3
+		
+	cmd_vel.publish(move_cmd)
+	time.sleep(0.1)
+	
+	curr_state = "GO_TO_BALL"
+
+reposition_timer = 0.0
+
+def state_reposition():
+	global curr_state
+	global reposition_timer
+	
+	if 0.0 <= reposition_timer <= 3.0:
+		# turn 90 degrees CCW
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.0
+		move_cmd.angular.z = np.pi / 2.0
+		cmd_vel.publish(move_cmd)
+	elif 3.0 <= reposition_timer <= 4.0:
+		# stop
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.0
+		move_cmd.angular.z = 0.0
+		cmd_vel.publish(move_cmd)
+	elif 4.0 <= reposition_timer <= 10.0:
+		# move in a 180 degree arc
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.3
+		move_cmd.angular.z = -np.pi / 4.0
+		cmd_vel.publish(move_cmd)
+	elif 10.0 <= reposition_timer <= 11.0:
+		# stop
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.0
+		move_cmd.angular.z = 0.0
+		cmd_vel.publish(move_cmd)
+	elif 11.0 <= reposition_timer <= 14.0:
+		# turn 90 degrees CW
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.0
+		move_cmd.angular.z = -np.pi / 2.0
+		cmd_vel.publish(move_cmd)
+	elif 14.0 <= reposition_timer <= 15.0:
+		# stop
+		move_cmd = Twist()
+		move_cmd.linear.x = 0.0
+		move_cmd.angular.z = 0.0
+		cmd_vel.publish(move_cmd)
+	else:
+		curr_state = "GO_TO_HUMAN"
+		
+	reposition_timer += 0.1
+	
+def state_go_to_human():
+	global curr_state
+	
+	controller.set_desired_points(desired_pts=[((205.0 - 320.0)/320.0, (220.0 - 240.0)/240.0, 0.24), ((435.0 - 320.0)/320.0, (450.0 - 240.0)/240.0, 0.24)])
+
+	move_cmd = Twist()
+	move_cmd.linear.x = 0.0
+	move_cmd.angular.z = 0.0
+	
+	# detect ball and drive to it
+	if curr_frame is not None:
+		converted_frame = bridgeObject.compressed_imgmsg_to_cv2(curr_frame)
+		
+		results = model(converted_frame, stream=True)
+		
+		if len(results) > 0:
+			for object in results:
+				boxes = object.boxes
+				for box in boxes:
+					if (classNames[int(box.cls[0])] == "scissors"):
+						x1,y1,x2,y2 = box.xyxy[0]
+						y_center = (float(y1) + float(y2))/2.0
+						#cv2.rectangle(converted_frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
+						cv2.circle(converted_frame, (int((x1+x2)/2), int((y1+y2)/2)), int((x2-x1)/2), (255, 0, 255), 3)
+						
+						focal_length = 960.0
+						curr_depth = (focal_length * 0.065)/(2 * int((x2-x1)/2))
+						#rospy.loginfo(f"curr_depth: {curr_depth}")
+						
+						curr_pts = [((float(x1) - 320.0)/320.0, (float(y1) - 240.0)/240.0, curr_depth), ((float(x2) - 320.0)/320.0, (float(y2) - 240.0)/240.0, curr_depth)]
+						#rospy.loginfo(f"pts: {curr_pts}")
+						controller.set_current_points(curr_pts=curr_pts)
+						controller.calculate_interaction_matrix()
+						
+						vels = controller.calculate_velocities()
+						#rospy.loginfo(f"vels: {vels}")
+						move_cmd.linear.x = vels[0][0]
+						move_cmd.angular.z = -vels[1][0]
+						cmd_vel.publish(move_cmd)
+						
+						err_norm = np.linalg.norm(controller.errs)
+						rospy.loginfo(f"err_norm: {err_norm}")
+						if err_norm < 0.1:
+							curr_state = "STOP"
+		else:
+			curr_state = "LOST_HUMAN"
+
+def state_lost_human():
+	global curr_state
+	
+	move_cmd = Twist()
+	move_cmd.linear.x = 0.0
+	move_cmd.angular.z = 0.0
+	
+	# turn to last known position of ball
+	if controller.curr_pts[0][0] < 0:
+		move_cmd.angular.z = -0.3
+	else:
+		move_cmd.angular.z = 0.3
+		
+	cmd_vel.publish(move_cmd)
+	time.sleep(0.1)
+	
+	curr_state = "GO_TO_HUMAN"
+
 def displayCallback(event):
 	#rospy.loginfo('displaying frame')
 	
@@ -347,74 +520,62 @@ def displayCallback(event):
 	if curr_frame is not None:
 		converted_frame = bridgeObject.compressed_imgmsg_to_cv2(curr_frame)
 		
-		results = model(converted_frame, stream=True)
+		rospy.loginfo(f"CURRENT STATE: {curr_state}")
+	
+		if curr_state == "GO_TO_BALL":
+			state_go_to_ball()
+		elif curr_state == "LOST_BALL":
+			state_lost_ball()
+		elif curr_state == "REPOSITION":
+			state_reposition()
+		elif curr_state == "GO_TO_HUMAN":
+			state_go_to_human()
+		elif curr_state == "LOST_HUMAN":
+			state_lost_human()
+		else: # STOP or invalid state
+			cmd_vel.publish(move_cmd)
 		
-		for object in results:
-			boxes = object.boxes
-			
-			for box in boxes:
-				if (classNames[int(box.cls[0])] == "apple" or classNames[int(box.cls[0])] == "frisbee" or classNames[int(box.cls[0])] == "mouse" or classNames[int(box.cls[0])] == "sports ball"):
-					x1,y1,x2,y2 = box.xyxy[0]
-					y_center = (float(y1) + float(y2))/2.0
-					#cv2.rectangle(converted_frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 3)
-					cv2.circle(converted_frame, (int((x1+x2)/2), int((y1+y2)/2)), int((x2-x1)/2), (255, 0, 255), 3)
-					
-					focal_length = 960.0
-					curr_depth = (focal_length * 0.065)/(2 * int((x2-x1)/2))
-					#rospy.loginfo(f"curr_depth: {curr_depth}")
-					
-					curr_pts = [((float(x1) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth), ((float(x2) - 320.0)/320.0, (y_center - 240.0)/240.0, curr_depth)]
-					#rospy.loginfo(f"pts: {curr_pts}")
-					controller.set_current_points(curr_pts=curr_pts)
-					controller.calculate_interaction_matrix()
-					
-					vels = controller.calculate_velocities()
-					#rospy.loginfo(f"vels: {vels}")
-					move_cmd.linear.x = vels[0][0]
-					move_cmd.angular.z = -vels[1][0]
-		
-		'''
-		mask = cv2.inRange(converted_frame, (70, 0, 0), (255, 60, 60))
-		mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-		converted_frame = converted_frame & mask_rgb
-
-		gray = cv2.cvtColor(converted_frame, cv2.COLOR_BGR2GRAY)
-		gray = cv2.medianBlur(gray, 5)
-		#_, gray = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
-
-		circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, gray.shape[0], param1=255, param2=10, minRadius=1, maxRadius=200)
-
-		if circles is not None and len(circles) <= 1:
-			circles = np.uint16(np.around(circles))
-			for i in circles[0, :]:
-				center = (float(i[0]), float(i[1]))
-				#rospy.loginfo(f"center: {center}")
-				cv2.circle(converted_frame, (int(center[0]), int(center[1])), 1, (0, 100, 100), 3)
-				radius = float(i[2])
-				#rospy.loginfo(f"radius: {radius}")
-				cv2.circle(converted_frame, (int(center[0]), int(center[1])), int(radius), (255, 0, 255), 3)
-				
-				#print(f"math: {center[0]} {center[0] - radius} {center[0] - radius - 320.0} {(center[0] - radius - 320.0)/320.0}")
-				
-				focal_length = 960.0
-				curr_depth = (focal_length * 0.065)/(2 * radius)
-				#rospy.loginfo(f"curr_depth: {curr_depth}")
-				
-				curr_pts = [((center[0] - radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth), ((center[0] + radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth)]
-				#rospy.loginfo(f"pts: {curr_pts}")
-				controller.set_current_points(curr_pts=curr_pts)
-				controller.calculate_interaction_matrix()
-				
-				vels = controller.calculate_velocities()
-				#rospy.loginfo(f"vels: {vels}")
-				move_cmd.linear.x = vels[0][0]
-				move_cmd.angular.z = -vels[1][0]
-		'''
-
 		cv2.imshow("camera", converted_frame)
 		cv2.waitKey(1)
-		
-	cmd_vel.publish(move_cmd)
+	
+	'''
+	mask = cv2.inRange(converted_frame, (70, 0, 0), (255, 60, 60))
+	mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+	converted_frame = converted_frame & mask_rgb
+
+	gray = cv2.cvtColor(converted_frame, cv2.COLOR_BGR2GRAY)
+	gray = cv2.medianBlur(gray, 5)
+	#_, gray = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
+
+	circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, gray.shape[0], param1=255, param2=10, minRadius=1, maxRadius=200)
+
+	if circles is not None and len(circles) <= 1:
+		circles = np.uint16(np.around(circles))
+		for i in circles[0, :]:
+			center = (float(i[0]), float(i[1]))
+			#rospy.loginfo(f"center: {center}")
+			cv2.circle(converted_frame, (int(center[0]), int(center[1])), 1, (0, 100, 100), 3)
+			radius = float(i[2])
+			#rospy.loginfo(f"radius: {radius}")
+			cv2.circle(converted_frame, (int(center[0]), int(center[1])), int(radius), (255, 0, 255), 3)
+			
+			#print(f"math: {center[0]} {center[0] - radius} {center[0] - radius - 320.0} {(center[0] - radius - 320.0)/320.0}")
+			
+			focal_length = 960.0
+			curr_depth = (focal_length * 0.065)/(2 * radius)
+			#rospy.loginfo(f"curr_depth: {curr_depth}")
+			
+			curr_pts = [((center[0] - radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth), ((center[0] + radius - 320.0)/320.0, (center[1] - 240.0)/240.0, curr_depth)]
+			#rospy.loginfo(f"pts: {curr_pts}")
+			controller.set_current_points(curr_pts=curr_pts)
+			controller.calculate_interaction_matrix()
+			
+			vels = controller.calculate_velocities()
+			#rospy.loginfo(f"vels: {vels}")
+			move_cmd.linear.x = vels[0][0]
+			move_cmd.angular.z = -vels[1][0]
+	'''
+
 
 def callbackFunction(message):
 	#bridgeObject = CvBridge()
@@ -444,3 +605,6 @@ rospy.spin()
 		#cv2.waitKey(1000)
 	#rate.sleep()
 cv2.destroyAllWindows()
+
+
+
